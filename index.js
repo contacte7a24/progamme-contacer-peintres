@@ -1,411 +1,79 @@
-import { useEffect, useState } from 'react';
+import { supabase } from '../../../lib/supabaseClient';
 
-async function api(path, options) {
-  const res = await fetch(path, {
-    headers: { 'Content-Type': 'application/json' },
-    ...options,
-  });
-  const data = await res.json();
-  if (!res.ok) throw new Error(data.error || 'حدث خطأ');
-  return data;
-}
+export default async function handler(req, res) {
+  if (req.method === 'GET') {
+    const { status, group_id } = req.query;
+    let query = supabase
+      .from('contacts')
+      .select('*, groups(name)')
+      .order('created_at', { ascending: true });
+    if (status) query = query.eq('status', status);
+    if (group_id) query = query.eq('group_id', group_id);
 
-export default function Home() {
-  const [tab, setTab] = useState('today');
-
-  return (
-    <div className="container">
-      <div className="header">
-        <h1>📋 متابعة جهات الاتصال</h1>
-        <p>10 اتصالات يومياً • تخطي عطلة نهاية الأسبوع • تناوب تلقائي بين المجموعات</p>
-      </div>
-
-      <div className="tabs">
-        <div className={`tab ${tab === 'today' ? 'active' : ''}`} onClick={() => setTab('today')}>اليوم</div>
-        <div className={`tab ${tab === 'contacts' ? 'active' : ''}`} onClick={() => setTab('contacts')}>جهات الاتصال</div>
-        <div className={`tab ${tab === 'groups' ? 'active' : ''}`} onClick={() => setTab('groups')}>المجموعات</div>
-        <div className={`tab ${tab === 'settings' ? 'active' : ''}`} onClick={() => setTab('settings')}>الإعدادات</div>
-      </div>
-
-      {tab === 'today' && <TodayTab />}
-      {tab === 'contacts' && <ContactsTab />}
-      {tab === 'groups' && <GroupsTab />}
-      {tab === 'settings' && <SettingsTab />}
-    </div>
-  );
-}
-
-function StatusMsg({ msg }) {
-  if (!msg) return null;
-  return <div className={`status-box ${msg.type}`}>{msg.text}</div>;
-}
-
-function TodayTab() {
-  const [data, setData] = useState(null);
-  const [loading, setLoading] = useState(true);
-  const [busy, setBusy] = useState(false);
-  const [msg, setMsg] = useState(null);
-
-  async function load() {
-    setLoading(true);
-    try {
-      const d = await api('/api/daily/today');
-      setData(d);
-    } catch (e) {
-      setMsg({ type: 'error', text: e.message });
-    }
-    setLoading(false);
+    const { data, error } = await query;
+    if (error) return res.status(500).json({ error: error.message });
+    return res.status(200).json(data);
   }
 
-  useEffect(() => { load(); }, []);
+  if (req.method === 'POST') {
+    const { name, phone, group_id, bulk } = req.body || {};
 
-  async function generate(sendToTelegram) {
-    setBusy(true);
-    setMsg(null);
-    try {
-      const r = await api('/api/daily/generate', {
-        method: 'POST',
-        body: JSON.stringify({ sendToTelegram }),
-      });
-      if (r.skipped) {
-        const reasons = {
-          weekend: 'اليوم عطلة نهاية أسبوع، لا يتم اختيار قائمة.',
-          already_generated: 'تم توليد قائمة اليوم مسبقاً.',
-          no_groups: 'لا توجد مجموعات بعد، أضف مجموعات أولاً.',
-          no_pending_contacts: 'لا توجد جهات اتصال بحالة "لم يُتصل بها" لاختيارها.',
-        };
-        setMsg({ type: 'error', text: reasons[r.reason] || 'تم التخطي.' });
-      } else {
-        setMsg({
-          type: 'success',
-          text: r.telegramSent
-            ? `تم توليد ${r.contacts.length} جهة اتصال وإرسالها إلى تيليجرام ✅`
-            : `تم توليد ${r.contacts.length} جهة اتصال ✅`,
+    // استيراد جماعي: كل سطر بصيغة الاسم,الرقم,المجموعة
+    if (bulk) {
+      const lines = bulk
+        .split('\n')
+        .map((l) => l.trim())
+        .filter(Boolean);
+
+      const { data: groups } = await supabase.from('groups').select('*');
+      const groupMap = {};
+      for (const g of groups || []) groupMap[g.name.trim().toLowerCase()] = g.id;
+
+      let maxOrder = groups && groups.length ? Math.max(...groups.map((g) => g.order_index)) : -1;
+
+      const rowsToInsert = [];
+      for (const line of lines) {
+        const parts = line.split(',').map((p) => p.trim());
+        if (parts.length < 3) continue;
+        const [cname, cphone, cgroup] = parts;
+        const key = cgroup.toLowerCase();
+        let gid = groupMap[key];
+        if (!gid) {
+          maxOrder += 1;
+          const { data: newGroup, error: gErr } = await supabase
+            .from('groups')
+            .insert({ name: cgroup, order_index: maxOrder })
+            .select()
+            .maybeSingle();
+          if (gErr) return res.status(500).json({ error: gErr.message });
+          gid = newGroup.id;
+          groupMap[key] = gid;
+        }
+        rowsToInsert.push({ name: cname, phone: cphone, group_id: gid, status: 'pending' });
+      }
+
+      if (rowsToInsert.length === 0) {
+        return res.status(400).json({
+          error: 'لم يتم العثور على أي صف صالح. الصيغة المطلوبة كل سطر: الاسم,الرقم,المجموعة',
         });
       }
-      await load();
-    } catch (e) {
-      setMsg({ type: 'error', text: e.message });
+
+      const { data, error } = await supabase.from('contacts').insert(rowsToInsert).select();
+      if (error) return res.status(500).json({ error: error.message });
+      return res.status(201).json({ inserted: data.length });
     }
-    setBusy(false);
+
+    if (!name || !phone || !group_id) {
+      return res.status(400).json({ error: 'الاسم والرقم والمجموعة مطلوبين' });
+    }
+    const { data, error } = await supabase
+      .from('contacts')
+      .insert({ name, phone, group_id, status: 'pending' })
+      .select()
+      .maybeSingle();
+    if (error) return res.status(500).json({ error: error.message });
+    return res.status(201).json(data);
   }
 
-  return (
-    <div>
-      <div className="card">
-        <h2>قائمة اليوم {data ? `— ${data.date}` : ''}</h2>
-        <StatusMsg msg={msg} />
-        <button onClick={() => generate(false)} disabled={busy}>
-          {busy ? 'جارٍ التوليد...' : 'توليد قائمة اليوم'}
-        </button>
-        <button className="secondary" onClick={() => generate(true)} disabled={busy}>
-          توليد + إرسال إلى تيليجرام الآن
-        </button>
-      </div>
-
-      <div className="card">
-        <h2>الأسماء ({data?.contacts?.length || 0})</h2>
-        {loading && <div className="empty">جارٍ التحميل...</div>}
-        {!loading && (!data || data.contacts.length === 0) && (
-          <div className="empty">لا توجد قائمة لهذا اليوم بعد</div>
-        )}
-        {!loading && data && data.contacts.map((c) => (
-          <div className="row" key={c.id}>
-            <div className="row-info">
-              <div className="row-name">{c.name}</div>
-              <div className="row-sub">{c.phone} • {c.groups?.name || ''}</div>
-            </div>
-            <span className="badge done">تم</span>
-          </div>
-        ))}
-      </div>
-    </div>
-  );
-}
-
-function ContactsTab() {
-  const [contacts, setContacts] = useState([]);
-  const [groups, setGroups] = useState([]);
-  const [loading, setLoading] = useState(true);
-  const [msg, setMsg] = useState(null);
-  const [filter, setFilter] = useState('');
-
-  const [name, setName] = useState('');
-  const [phone, setPhone] = useState('');
-  const [groupId, setGroupId] = useState('');
-  const [bulk, setBulk] = useState('');
-
-  async function load() {
-    setLoading(true);
-    try {
-      const [c, g] = await Promise.all([api('/api/contacts'), api('/api/groups')]);
-      setContacts(c);
-      setGroups(g);
-    } catch (e) {
-      setMsg({ type: 'error', text: e.message });
-    }
-    setLoading(false);
-  }
-
-  useEffect(() => { load(); }, []);
-
-  async function addSingle(e) {
-    e.preventDefault();
-    setMsg(null);
-    try {
-      await api('/api/contacts', {
-        method: 'POST',
-        body: JSON.stringify({ name, phone, group_id: groupId }),
-      });
-      setName(''); setPhone(''); setGroupId('');
-      setMsg({ type: 'success', text: 'تمت إضافة جهة الاتصال ✅' });
-      load();
-    } catch (e) {
-      setMsg({ type: 'error', text: e.message });
-    }
-  }
-
-  async function addBulk(e) {
-    e.preventDefault();
-    setMsg(null);
-    try {
-      const r = await api('/api/contacts', { method: 'POST', body: JSON.stringify({ bulk }) });
-      setBulk('');
-      setMsg({ type: 'success', text: `تم استيراد ${r.inserted} جهة اتصال ✅` });
-      load();
-    } catch (e) {
-      setMsg({ type: 'error', text: e.message });
-    }
-  }
-
-  async function toggleStatus(c) {
-    try {
-      await api(`/api/contacts/${c.id}`, {
-        method: 'PATCH',
-        body: JSON.stringify({ status: c.status === 'pending' ? 'done' : 'pending' }),
-      });
-      load();
-    } catch (e) {
-      setMsg({ type: 'error', text: e.message });
-    }
-  }
-
-  async function remove(id) {
-    try {
-      await api(`/api/contacts/${id}`, { method: 'DELETE' });
-      load();
-    } catch (e) {
-      setMsg({ type: 'error', text: e.message });
-    }
-  }
-
-  const filtered = contacts.filter((c) =>
-    c.name.toLowerCase().includes(filter.toLowerCase()) || c.phone.includes(filter)
-  );
-
-  return (
-    <div>
-      <StatusMsg msg={msg} />
-
-      <div className="card">
-        <h2>إضافة جهة اتصال واحدة</h2>
-        <form onSubmit={addSingle}>
-          <input placeholder="الاسم" value={name} onChange={(e) => setName(e.target.value)} required />
-          <input placeholder="رقم الهاتف" value={phone} onChange={(e) => setPhone(e.target.value)} required />
-          <select value={groupId} onChange={(e) => setGroupId(e.target.value)} required>
-            <option value="">اختر المجموعة</option>
-            {groups.map((g) => <option key={g.id} value={g.id}>{g.name}</option>)}
-          </select>
-          <button type="submit">إضافة</button>
-        </form>
-      </div>
-
-      <div className="card">
-        <h2>استيراد جماعي</h2>
-        <p className="row-sub" style={{ marginBottom: 8 }}>
-          كل سطر بصيغة: الاسم,الرقم,اسم المجموعة — إذا كانت المجموعة غير موجودة سيتم إنشاؤها تلقائياً
-        </p>
-        <form onSubmit={addBulk}>
-          <textarea
-            placeholder={'مثال:\nأحمد علي,0500000000,عملاء جدد\nسارة محمد,0511111111,متابعة'}
-            value={bulk}
-            onChange={(e) => setBulk(e.target.value)}
-            required
-          />
-          <button type="submit">استيراد</button>
-        </form>
-      </div>
-
-      <div className="card">
-        <h2>كل جهات الاتصال ({contacts.length})</h2>
-        <input placeholder="بحث بالاسم أو الرقم..." value={filter} onChange={(e) => setFilter(e.target.value)} />
-        {loading && <div className="empty">جارٍ التحميل...</div>}
-        {!loading && filtered.length === 0 && <div className="empty">لا توجد نتائج</div>}
-        {!loading && filtered.map((c) => (
-          <div className="row" key={c.id}>
-            <div className="row-info">
-              <div className="row-name">{c.name}</div>
-              <div className="row-sub">{c.phone} • {c.groups?.name || ''}</div>
-            </div>
-            <span className={`badge ${c.status}`} style={{ cursor: 'pointer' }} onClick={() => toggleStatus(c)}>
-              {c.status === 'pending' ? 'لم يُتصل' : 'تم'}
-            </span>
-            <button className="danger small-btn" onClick={() => remove(c.id)}>حذف</button>
-          </div>
-        ))}
-      </div>
-    </div>
-  );
-}
-
-function SettingsTab() {
-  const [sheetUrl, setSheetUrl] = useState('');
-  const [loading, setLoading] = useState(true);
-  const [saving, setSaving] = useState(false);
-  const [syncing, setSyncing] = useState(false);
-  const [msg, setMsg] = useState(null);
-
-  async function load() {
-    setLoading(true);
-    try {
-      const r = await api('/api/settings');
-      setSheetUrl(r.sheet_url || '');
-    } catch (e) {
-      setMsg({ type: 'error', text: e.message });
-    }
-    setLoading(false);
-  }
-
-  useEffect(() => { load(); }, []);
-
-  async function save(e) {
-    e.preventDefault();
-    setSaving(true);
-    setMsg(null);
-    try {
-      await api('/api/settings', { method: 'POST', body: JSON.stringify({ sheet_url: sheetUrl }) });
-      setMsg({ type: 'success', text: 'تم حفظ الرابط ✅' });
-    } catch (e) {
-      setMsg({ type: 'error', text: e.message });
-    }
-    setSaving(false);
-  }
-
-  async function syncNow() {
-    setSyncing(true);
-    setMsg(null);
-    try {
-      const r = await api('/api/contacts/sync-sheet', { method: 'POST' });
-      setMsg({
-        type: 'success',
-        text: `تمت المزامنة: ${r.inserted} جهة اتصال جديدة، تم تجاوز ${r.skipped} (مكررة) ✅`,
-      });
-    } catch (e) {
-      setMsg({ type: 'error', text: e.message });
-    }
-    setSyncing(false);
-  }
-
-  return (
-    <div>
-      <StatusMsg msg={msg} />
-
-      <div className="card">
-        <h2>ربط جوجل شيت</h2>
-        <p className="row-sub" style={{ marginBottom: 10 }}>
-          من جوجل شيت: File → Share → Publish to web → اختر الشيت المطلوب وصيغة CSV → انسخ الرابط والصقه هنا.
-          يجب أن يحتوي الشيت على صف عناوين فيه أعمدة بأسماء مثل: الاسم، الرقم، المجموعة (وعمود اختياري للحالة).
-        </p>
-        {loading ? (
-          <div className="empty">جارٍ التحميل...</div>
-        ) : (
-          <form onSubmit={save}>
-            <input
-              placeholder="https://docs.google.com/.../pub?output=csv"
-              value={sheetUrl}
-              onChange={(e) => setSheetUrl(e.target.value)}
-            />
-            <button type="submit" disabled={saving}>{saving ? 'جارٍ الحفظ...' : 'حفظ الرابط'}</button>
-          </form>
-        )}
-        <button className="secondary" onClick={syncNow} disabled={syncing || !sheetUrl}>
-          {syncing ? 'جارٍ المزامنة...' : 'مزامنة الآن'}
-        </button>
-        <p className="row-sub" style={{ marginTop: 6 }}>
-          سيتم سحب جهات الاتصال الجديدة تلقائياً من الشيت كل صباح قبل توليد قائمة اليوم، إضافة إلى إمكانية المزامنة اليدوية هنا في أي وقت.
-        </p>
-      </div>
-    </div>
-  );
-}
-
-function GroupsTab() {
-  const [groups, setGroups] = useState([]);
-  const [name, setName] = useState('');
-  const [loading, setLoading] = useState(true);
-  const [msg, setMsg] = useState(null);
-
-  async function load() {
-    setLoading(true);
-    try {
-      const g = await api('/api/groups');
-      setGroups(g);
-    } catch (e) {
-      setMsg({ type: 'error', text: e.message });
-    }
-    setLoading(false);
-  }
-
-  useEffect(() => { load(); }, []);
-
-  async function add(e) {
-    e.preventDefault();
-    setMsg(null);
-    try {
-      await api('/api/groups', { method: 'POST', body: JSON.stringify({ name }) });
-      setName('');
-      load();
-    } catch (e) {
-      setMsg({ type: 'error', text: e.message });
-    }
-  }
-
-  async function remove(id) {
-    try {
-      await api(`/api/groups?id=${id}`, { method: 'DELETE' });
-      load();
-    } catch (e) {
-      setMsg({ type: 'error', text: e.message });
-    }
-  }
-
-  return (
-    <div>
-      <StatusMsg msg={msg} />
-      <div className="card">
-        <h2>إضافة مجموعة جديدة</h2>
-        <form onSubmit={add}>
-          <input placeholder="اسم المجموعة" value={name} onChange={(e) => setName(e.target.value)} required />
-          <button type="submit">إضافة</button>
-        </form>
-      </div>
-
-      <div className="card">
-        <h2>ترتيب التناوب بين المجموعات ({groups.length})</h2>
-        <p className="row-sub" style={{ marginBottom: 8 }}>
-          الاختيار اليومي يبدأ من المجموعة الأولى ثم ينتقل تلقائياً للتالية عند نفاد الأسماء
-        </p>
-        {loading && <div className="empty">جارٍ التحميل...</div>}
-        {!loading && groups.length === 0 && <div className="empty">لا توجد مجموعات بعد</div>}
-        {!loading && groups.map((g, i) => (
-          <div className="row" key={g.id}>
-            <div className="row-info">
-              <div className="row-name">{i + 1}. {g.name}</div>
-            </div>
-            <button className="danger small-btn" onClick={() => remove(g.id)}>حذف</button>
-          </div>
-        ))}
-      </div>
-    </div>
-  );
+  res.status(405).end();
 }
